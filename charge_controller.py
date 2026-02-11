@@ -59,25 +59,36 @@ def load_config(require_switchbot=True):
 # --- Looop Denki API ---
 
 def fetch_prices(area="01"):
-    """Fetch today's 48 half-hour electricity prices from Looop API.
+    """Fetch today's and tomorrow's half-hour electricity prices from Looop API.
 
-    Returns list of 48 float prices (yen/kWh).
+    Returns dict with "today" (48 floats) and "tomorrow" (48 floats).
     """
     resp = requests.get(LOOOP_API_URL, params={"select_area": area}, timeout=30)
     resp.raise_for_status()
     data = resp.json()
-    return data["1"]["price_data"]
+    return {
+        "today": data["1"]["price_data"],
+        "tomorrow": data["2"]["price_data"],
+    }
 
 
 def get_current_price_info(prices):
-    """Get current slot price and daily average.
+    """Get current slot price and rolling 24h-ahead average.
+
+    Uses remaining slots today + enough slots from tomorrow to form
+    a 48-slot (24h) window starting from the current slot.
 
     Returns dict with current_price, average_price, slot_index.
     """
     now = datetime.datetime.now(JST)
     slot_index = now.hour * 2 + (1 if now.minute >= 30 else 0)
-    current_price = prices[slot_index]
-    average_price = sum(prices) / len(prices)
+    current_price = prices["today"][slot_index]
+
+    remaining_today = prices["today"][slot_index:]
+    needed_from_tomorrow = 48 - len(remaining_today)
+    window = remaining_today + prices["tomorrow"][:needed_from_tomorrow]
+    average_price = sum(window) / len(window)
+
     return {
         "current_price": current_price,
         "average_price": average_price,
@@ -391,7 +402,7 @@ def cmd_prices(args):
     price_info = get_current_price_info(prices)
 
     print(f"Area: {area}")
-    print(f"Average: {price_info['average_price']:.2f} yen/kWh")
+    print(f"Average (24h ahead): {price_info['average_price']:.2f} yen/kWh")
     print(f"Current slot ({price_info['slot_index']}): {price_info['current_price']:.2f} yen/kWh")
     print()
     print("Time             Price   vs Avg")
@@ -401,7 +412,7 @@ def cmd_prices(args):
     current_slot = now.hour * 2 + (1 if now.minute >= 30 else 0)
     avg = price_info["average_price"]
 
-    for i, price in enumerate(prices):
+    for i, price in enumerate(prices["today"]):
         h = i // 2
         m = "30" if i % 2 else "00"
         marker = " <--" if i == current_slot else ""
