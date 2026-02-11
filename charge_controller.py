@@ -13,10 +13,14 @@ import hashlib
 import hmac
 import json
 import os
+import sqlite3
 import sys
 import time
 import uuid
 from pathlib import Path
+from zoneinfo import ZoneInfo
+
+JST = ZoneInfo("Asia/Tokyo")
 
 import requests
 from dotenv import load_dotenv
@@ -24,6 +28,7 @@ from dotenv import load_dotenv
 import bluetti_battery
 
 ENV_PATH = Path(__file__).parent / ".env"
+DB_PATH = Path(__file__).parent / "soc_history.db"
 
 LOOOP_API_URL = "https://looop-denki.com/api/prices"
 SWITCHBOT_API_BASE = "https://api.switch-bot.com/v1.1"
@@ -61,7 +66,7 @@ def fetch_prices(area="01"):
     resp = requests.get(LOOOP_API_URL, params={"select_area": area}, timeout=30)
     resp.raise_for_status()
     data = resp.json()
-    return data["0"]["price_data"]
+    return data["1"]["price_data"]
 
 
 def get_current_price_info(prices):
@@ -69,7 +74,7 @@ def get_current_price_info(prices):
 
     Returns dict with current_price, average_price, slot_index.
     """
-    now = datetime.datetime.now()
+    now = datetime.datetime.now(JST)
     slot_index = now.hour * 2 + (1 if now.minute >= 30 else 0)
     current_price = prices[slot_index]
     average_price = sum(prices) / len(prices)
@@ -177,6 +182,108 @@ def get_battery_soc():
     return None
 
 
+# --- SOC History ---
+
+def _get_db():
+    """Open SOC history database, creating table if needed."""
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS soc_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            soc INTEGER NOT NULL,
+            charging INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_soc_history_timestamp
+        ON soc_history(timestamp)
+    """)
+    conn.commit()
+    return conn
+
+
+def record_soc(soc, charging=False):
+    """Record a SOC reading with timestamp. Prunes records older than 30 days."""
+    now = datetime.datetime.now(JST)
+    conn = _get_db()
+    try:
+        conn.execute(
+            "INSERT INTO soc_history (timestamp, soc, charging) VALUES (?, ?, ?)",
+            (now.isoformat(), soc, int(charging)),
+        )
+        cutoff = (now - datetime.timedelta(days=30)).isoformat()
+        conn.execute("DELETE FROM soc_history WHERE timestamp < ?", (cutoff,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_consumption_rate(hours=24):
+    """Calculate average battery consumption rate from recent discharge periods.
+
+    Returns rate in %/hour, or None if insufficient data.
+    """
+    since = (datetime.datetime.now(JST) - datetime.timedelta(hours=hours)).isoformat()
+    conn = _get_db()
+    try:
+        rows = conn.execute(
+            "SELECT timestamp, soc, charging FROM soc_history "
+            "WHERE timestamp >= ? ORDER BY timestamp",
+            (since,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    if len(rows) < 2:
+        return None
+
+    rates = []
+    for i in range(1, len(rows)):
+        prev_ts, prev_soc, prev_charging = rows[i - 1]
+        curr_ts, curr_soc, curr_charging = rows[i]
+
+        if prev_charging or curr_charging:
+            continue
+
+        delta_soc = prev_soc - curr_soc
+        if delta_soc <= 0:
+            continue
+
+        prev_dt = datetime.datetime.fromisoformat(prev_ts)
+        curr_dt = datetime.datetime.fromisoformat(curr_ts)
+        delta_hours = (curr_dt - prev_dt).total_seconds() / 3600
+
+        if delta_hours <= 0 or delta_hours > 2:
+            continue
+
+        rates.append(delta_soc / delta_hours)
+
+    if not rates:
+        return None
+
+    return sum(rates) / len(rates)
+
+
+def get_soc_history(hours=24):
+    """Fetch SOC history records for the given number of hours."""
+    since = (datetime.datetime.now(JST) - datetime.timedelta(hours=hours)).isoformat()
+    conn = _get_db()
+    try:
+        rows = conn.execute(
+            "SELECT timestamp, soc, charging FROM soc_history "
+            "WHERE timestamp >= ? ORDER BY timestamp",
+            (since,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    return [
+        {"timestamp": ts, "soc": soc, "charging": bool(charging)}
+        for ts, soc, charging in rows
+    ]
+
+
 # --- Charge Decision ---
 
 def decide_charge(soc, current_price, average_price, soc_min, soc_max):
@@ -209,7 +316,7 @@ def decide_charge(soc, current_price, average_price, soc_min, soc_max):
 
 def cmd_run(args):
     """Main charge control logic."""
-    now = datetime.datetime.now()
+    now = datetime.datetime.now(JST)
     print(f"=== charge_controller {now.strftime('%Y-%m-%d %H:%M:%S')} ===")
 
     config = load_config(require_switchbot=not args.dry_run)
@@ -239,6 +346,11 @@ def cmd_run(args):
         f"Decision: {'CHARGE ON' if decision['charge'] else 'CHARGE OFF'}"
         f" - {decision['reason']}"
     )
+
+    try:
+        record_soc(soc, charging=(decision["charge"] and not args.dry_run))
+    except Exception as e:
+        print(f"Warning: Failed to record SOC history: {e}", file=sys.stderr)
 
     if args.dry_run:
         print("[DRY RUN] Skipping plug control")
@@ -285,7 +397,7 @@ def cmd_prices(args):
     print("Time             Price   vs Avg")
     print("-" * 40)
 
-    now = datetime.datetime.now()
+    now = datetime.datetime.now(JST)
     current_slot = now.hour * 2 + (1 if now.minute >= 30 else 0)
     avg = price_info["average_price"]
 
@@ -295,6 +407,34 @@ def cmd_prices(args):
         marker = " <--" if i == current_slot else ""
         diff = "cheap" if price <= avg else "HIGH"
         print(f"  {h:02d}:{m}  {price:8.2f}  {diff:>5}{marker}")
+
+
+def cmd_history(args):
+    """Show SOC history and consumption stats."""
+    hours = args.hours
+    records = get_soc_history(hours)
+
+    if not records:
+        print(f"No SOC history in the last {hours} hours.")
+        return
+
+    rate = get_consumption_rate(hours)
+
+    print(f"SOC history (last {hours}h): {len(records)} records")
+    if rate is not None:
+        print(f"Avg consumption rate: {rate:.1f} %/hour ({rate * 0.5:.1f} %/slot)")
+    else:
+        print("Avg consumption rate: insufficient data")
+    print()
+
+    print("Time              SOC   Status")
+    print("-" * 40)
+    for r in records:
+        dt = datetime.datetime.fromisoformat(r["timestamp"])
+        time_str = dt.strftime("%m-%d %H:%M")
+        status = "CHG" if r["charging"] else "   "
+        bar = "#" * (r["soc"] // 5)
+        print(f"  {time_str}  {r['soc']:3d}%  {status}  |{bar}")
 
 
 def main():
@@ -309,6 +449,11 @@ def main():
     sub.add_parser("list-devices", help="List SwitchBot devices")
     sub.add_parser("prices", help="Show today's electricity prices")
 
+    history_parser = sub.add_parser("history", help="Show SOC history and stats")
+    history_parser.add_argument(
+        "--hours", type=int, default=24, help="Hours of history to show (default: 24)"
+    )
+
     args = parser.parse_args()
 
     if args.command == "list-devices":
@@ -317,6 +462,8 @@ def main():
         cmd_prices(args)
     elif args.command == "run":
         cmd_run(args)
+    elif args.command == "history":
+        cmd_history(args)
     else:
         # Default to run with dry-run when no command given
         parser.print_help()
