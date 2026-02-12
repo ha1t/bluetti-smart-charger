@@ -95,6 +95,8 @@ def get_current_price_info(prices):
         "current_price": current_price,
         "average_price": average_price,
         "slot_index": slot_index,
+        "window_slots": len(window),
+        "tomorrow_available": prices["tomorrow"] is not None,
     }
 
 
@@ -334,44 +336,61 @@ def cmd_run(args):
 
     config = load_config(require_switchbot=not args.dry_run)
 
-    soc = get_battery_soc()
-    if soc is None:
-        print("Error: Could not get battery SOC", file=sys.stderr)
-        sys.exit(1)
-    print(f"Battery SOC: {soc}%")
-
-    prices = fetch_prices(config["looop_area"])
-    price_info = get_current_price_info(prices)
-    print(
-        f"Current price: {price_info['current_price']:.2f} yen/kWh"
-        f" (slot {price_info['slot_index']}/47)"
-    )
-    print(f"Average price: {price_info['average_price']:.2f} yen/kWh")
-
-    decision = decide_charge(
-        soc,
-        price_info["current_price"],
-        price_info["average_price"],
-        config["soc_min"],
-        config["soc_max"],
-    )
-    print(
-        f"Decision: {'CHARGE ON' if decision['charge'] else 'CHARGE OFF'}"
-        f" - {decision['reason']}"
-    )
-
     try:
-        record_soc(soc, charging=(decision["charge"] and not args.dry_run))
+        soc = get_battery_soc()
+        if soc is None:
+            print("Error: Could not get battery SOC", file=sys.stderr)
+            sys.exit(1)
+        print(f"Battery SOC: {soc}%")
+
+        prices = fetch_prices(config["looop_area"])
+        price_info = get_current_price_info(prices)
+        print(
+            f"Current price: {price_info['current_price']:.2f} yen/kWh"
+            f" (slot {price_info['slot_index']}/47)"
+        )
+        tomorrow_tag = "" if price_info["tomorrow_available"] else " [tomorrow N/A]"
+        print(
+            f"Average price: {price_info['average_price']:.2f} yen/kWh"
+            f" ({price_info['window_slots']}/48 slots){tomorrow_tag}"
+        )
+
+        decision = decide_charge(
+            soc,
+            price_info["current_price"],
+            price_info["average_price"],
+            config["soc_min"],
+            config["soc_max"],
+        )
+        print(
+            f"Decision: {'CHARGE ON' if decision['charge'] else 'CHARGE OFF'}"
+            f" - {decision['reason']}"
+        )
+
+        try:
+            record_soc(soc, charging=(decision["charge"] and not args.dry_run))
+        except Exception as e:
+            print(f"Warning: Failed to record SOC history: {e}", file=sys.stderr)
+
+        if args.dry_run:
+            print("[DRY RUN] Skipping plug control")
+        else:
+            action = switchbot_set_power(config, decision["charge"])
+            print(f"Plug action: {action}")
+
+        print("=== done ===")
+
     except Exception as e:
-        print(f"Warning: Failed to record SOC history: {e}", file=sys.stderr)
-
-    if args.dry_run:
-        print("[DRY RUN] Skipping plug control")
-    else:
-        action = switchbot_set_power(config, decision["charge"])
-        print(f"Plug action: {action}")
-
-    print("=== done ===")
+        import traceback
+        print(f"FAIL-SAFE: Error occurred: {e}", file=sys.stderr)
+        traceback.print_exc()
+        if not args.dry_run:
+            try:
+                action = switchbot_set_power(config, True)
+                print(f"FAIL-SAFE: Charger turned ON ({action})")
+            except Exception as e2:
+                print(f"FAIL-SAFE: Could not control plug: {e2}", file=sys.stderr)
+        print("=== done (fail-safe) ===")
 
 
 def cmd_list_devices(args):
