@@ -61,14 +61,15 @@ def load_config(require_switchbot=True):
 def fetch_prices(area="01"):
     """Fetch today's and tomorrow's half-hour electricity prices from Looop API.
 
-    Returns dict with "today" (48 floats) and "tomorrow" (48 floats).
+    Returns dict with "today" (48 floats) and "tomorrow" (48 floats or None if not yet available).
     """
     resp = requests.get(LOOOP_API_URL, params={"select_area": area}, timeout=30)
     resp.raise_for_status()
     data = resp.json()
+    tomorrow_data = data["2"].get("price_data", None)
     return {
         "today": data["1"]["price_data"],
-        "tomorrow": data["2"]["price_data"],
+        "tomorrow": tomorrow_data,
     }
 
 
@@ -85,8 +86,9 @@ def get_current_price_info(prices):
     current_price = prices["today"][slot_index]
 
     remaining_today = prices["today"][slot_index:]
+    tomorrow = prices["tomorrow"] if prices["tomorrow"] is not None else []
     needed_from_tomorrow = 48 - len(remaining_today)
-    window = remaining_today + prices["tomorrow"][:needed_from_tomorrow]
+    window = remaining_today + tomorrow[:needed_from_tomorrow]
     average_price = sum(window) / len(window)
 
     return {
