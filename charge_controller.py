@@ -23,6 +23,7 @@ from zoneinfo import ZoneInfo
 JST = ZoneInfo("Asia/Tokyo")
 
 import requests
+from requests.exceptions import ConnectionError, Timeout
 from dotenv import load_dotenv
 
 import bluetti_battery
@@ -32,6 +33,41 @@ DB_PATH = Path(__file__).parent / "soc_history.db"
 
 LOOOP_API_URL = "https://looop-denki.com/api/prices"
 SWITCHBOT_API_BASE = "https://api.switch-bot.com/v1.1"
+
+
+# --- HTTP retry helper ---
+
+def _request_with_retry(method, url, max_retries=3, **kwargs):
+    """HTTP request with exponential backoff retry.
+
+    Retries on: ConnectionError, Timeout, HTTP 5xx, 429.
+    Does NOT retry on: HTTP 4xx (except 429).
+    """
+    kwargs.setdefault("timeout", 30)
+    last_exc = None
+    for attempt in range(max_retries + 1):
+        try:
+            resp = requests.request(method, url, **kwargs)
+            if resp.status_code == 429 or resp.status_code >= 500:
+                if attempt < max_retries:
+                    wait = 2 ** attempt
+                    print(f"Retry {attempt+1}/{max_retries}: HTTP {resp.status_code} from {url}, waiting {wait}s", file=sys.stderr)
+                    time.sleep(wait)
+                    continue
+            resp.raise_for_status()
+            return resp
+        except (ConnectionError, Timeout) as e:
+            last_exc = e
+            if attempt < max_retries:
+                wait = 2 ** attempt
+                print(f"Retry {attempt+1}/{max_retries}: {type(e).__name__} for {url}, waiting {wait}s", file=sys.stderr)
+                time.sleep(wait)
+                continue
+            raise
+        except requests.HTTPError:
+            raise
+    # Should not reach here, but just in case
+    raise last_exc
 
 
 # --- Configuration ---
@@ -46,6 +82,8 @@ def load_config(require_switchbot=True):
         "looop_area": os.getenv("LOOOP_AREA", "01"),
         "soc_min": int(os.getenv("SOC_MIN", "20")),
         "soc_max": int(os.getenv("SOC_MAX", "80")),
+        "charge_rate_pct_per_slot": float(os.getenv("CHARGE_RATE_PCT_PER_SLOT", "10")),
+        "default_consumption_rate": float(os.getenv("DEFAULT_CONSUMPTION_RATE", "3.0")),
     }
     if require_switchbot:
         required = ["switchbot_token", "switchbot_secret", "switchbot_device_id"]
@@ -63,8 +101,7 @@ def fetch_prices(area="01"):
 
     Returns dict with "today" (48 floats) and "tomorrow" (48 floats or None if not yet available).
     """
-    resp = requests.get(LOOOP_API_URL, params={"select_area": area}, timeout=30)
-    resp.raise_for_status()
+    resp = _request_with_retry("GET", LOOOP_API_URL, params={"select_area": area})
     data = resp.json()
     tomorrow_data = data["2"].get("price_data", None)
     return {
@@ -96,8 +133,48 @@ def get_current_price_info(prices):
         "average_price": average_price,
         "slot_index": slot_index,
         "window_slots": len(window),
+        "window_prices": window,
         "tomorrow_available": prices["tomorrow"] is not None,
     }
+
+
+def calculate_slots_needed(soc, soc_max, consumption_rate, charge_rate_per_slot, window_size):
+    """Calculate how many charge slots are needed in the next 24h.
+
+    Args:
+        soc: Current SOC %.
+        soc_max: Target max SOC %.
+        consumption_rate: Battery consumption in %/hour.
+        charge_rate_per_slot: SOC % gained per 30-min charge slot.
+        window_size: Number of slots in the price window.
+
+    Returns number of slots to charge (0..window_size).
+    """
+    soc_gap = max(0, soc_max - soc)
+    window_hours = window_size * 0.5
+    total_consumption = consumption_rate * window_hours
+    total_charge_needed = soc_gap + total_consumption
+
+    net_charge_per_slot = charge_rate_per_slot - (consumption_rate * 0.5)
+    if net_charge_per_slot <= 0:
+        return window_size
+
+    slots = int(-(-total_charge_needed // net_charge_per_slot))  # ceil division
+    return min(slots, window_size)
+
+
+def get_cheapest_slots(window_prices, n):
+    """Return set of indices of the N cheapest slots in the price window.
+
+    Ties are broken by earlier slot index (prefer charging sooner).
+    """
+    if n <= 0:
+        return set()
+    if n >= len(window_prices):
+        return set(range(len(window_prices)))
+    indexed = [(price, i) for i, price in enumerate(window_prices)]
+    indexed.sort(key=lambda x: (x[0], x[1]))
+    return {i for _, i in indexed[:n]}
 
 
 # --- SwitchBot Plug Mini API ---
@@ -126,10 +203,7 @@ def switchbot_headers(token, secret):
 def switchbot_list_devices(config):
     """List all SwitchBot devices."""
     headers = switchbot_headers(config["switchbot_token"], config["switchbot_secret"])
-    resp = requests.get(
-        f"{SWITCHBOT_API_BASE}/devices", headers=headers, timeout=30
-    )
-    resp.raise_for_status()
+    resp = _request_with_retry("GET", f"{SWITCHBOT_API_BASE}/devices", headers=headers)
     data = resp.json()
     if data.get("statusCode") != 100:
         print(f"Error: SwitchBot API: {data.get('message')}", file=sys.stderr)
@@ -144,8 +218,7 @@ def switchbot_get_status(config):
     """
     url = f"{SWITCHBOT_API_BASE}/devices/{config['switchbot_device_id']}/status"
     headers = switchbot_headers(config["switchbot_token"], config["switchbot_secret"])
-    resp = requests.get(url, headers=headers, timeout=30)
-    resp.raise_for_status()
+    resp = _request_with_retry("GET", url, headers=headers)
     data = resp.json()
     if data.get("statusCode") != 100:
         print(f"Error: SwitchBot API: {data.get('message')}", file=sys.stderr)
@@ -175,8 +248,7 @@ def switchbot_set_power(config, turn_on):
         "parameter": "default",
         "commandType": "command",
     }
-    resp = requests.post(url, headers=headers, json=payload, timeout=30)
-    resp.raise_for_status()
+    resp = _request_with_retry("POST", url, headers=headers, json=payload)
     return "turned_on" if turn_on else "turned_off"
 
 
@@ -301,29 +373,60 @@ def get_soc_history(hours=24):
 
 # --- Charge Decision ---
 
-def decide_charge(soc, current_price, average_price, soc_min, soc_max):
-    """Decide whether to charge based on SOC and electricity price.
+def decide_charge(soc, price_info, config, consumption_rate=None):
+    """Decide whether to charge based on SOC and cheapest-N-slots strategy.
 
     Priority:
       1. SOC <= soc_min -> force charge
       2. SOC >= soc_max -> stop charge
-      3. price <= average -> charge
-      4. price > average -> stop
+      3. Calculate needed charge slots from consumption rate and SOC gap,
+         then charge only during the cheapest N slots in the 24h window.
 
-    Returns dict with charge (bool) and reason (str).
+    Returns dict with charge (bool), reason (str), and slots_needed (int or None).
     """
+    soc_min = config["soc_min"]
+    soc_max = config["soc_max"]
+
     if soc <= soc_min:
-        return {"charge": True, "reason": f"SOC {soc}% <= {soc_min}% (force charge)"}
+        return {"charge": True, "reason": f"SOC {soc}% <= {soc_min}% (force charge)", "slots_needed": None}
     if soc >= soc_max:
-        return {"charge": False, "reason": f"SOC {soc}% >= {soc_max}% (stop charge)"}
-    if current_price <= average_price:
+        return {"charge": False, "reason": f"SOC {soc}% >= {soc_max}% (stop charge)", "slots_needed": None}
+
+    rate = consumption_rate if consumption_rate is not None else config["default_consumption_rate"]
+    window_prices = price_info["window_prices"]
+    slots_needed = calculate_slots_needed(
+        soc, soc_max, rate,
+        config["charge_rate_pct_per_slot"],
+        len(window_prices),
+    )
+
+    if slots_needed == 0:
+        return {
+            "charge": False,
+            "reason": f"SOC {soc}% near target, no charge needed (N=0)",
+            "slots_needed": 0,
+        }
+
+    cheapest = get_cheapest_slots(window_prices, slots_needed)
+    # Slot 0 in the window is the current slot
+    is_cheap_slot = 0 in cheapest
+
+    if is_cheap_slot:
         return {
             "charge": True,
-            "reason": f"price {current_price:.2f} <= avg {average_price:.2f} (cheap)",
+            "reason": (
+                f"price {price_info['current_price']:.2f} is in cheapest {slots_needed}"
+                f"/{len(window_prices)} slots (charge)"
+            ),
+            "slots_needed": slots_needed,
         }
     return {
         "charge": False,
-        "reason": f"price {current_price:.2f} > avg {average_price:.2f} (expensive)",
+        "reason": (
+            f"price {price_info['current_price']:.2f} is NOT in cheapest {slots_needed}"
+            f"/{len(window_prices)} slots (wait)"
+        ),
+        "slots_needed": slots_needed,
     }
 
 
@@ -355,16 +458,17 @@ def cmd_run(args):
             f" ({price_info['window_slots']}/48 slots){tomorrow_tag}"
         )
 
-        decision = decide_charge(
-            soc,
-            price_info["current_price"],
-            price_info["average_price"],
-            config["soc_min"],
-            config["soc_max"],
-        )
+        consumption_rate = get_consumption_rate()
+        if consumption_rate is not None:
+            print(f"Consumption rate: {consumption_rate:.1f} %/h (from history)")
+        else:
+            print(f"Consumption rate: {config['default_consumption_rate']:.1f} %/h (default)")
+
+        decision = decide_charge(soc, price_info, config, consumption_rate)
+        slots_info = f" [N={decision['slots_needed']}]" if decision["slots_needed"] is not None else ""
         print(
             f"Decision: {'CHARGE ON' if decision['charge'] else 'CHARGE OFF'}"
-            f" - {decision['reason']}"
+            f" - {decision['reason']}{slots_info}"
         )
 
         try:

@@ -17,6 +17,7 @@ from pathlib import Path
 from threading import Thread
 
 import requests
+from requests.exceptions import ConnectionError, Timeout
 from dotenv import load_dotenv, set_key
 
 # BLUETTI API endpoints (from official HA integration source)
@@ -32,6 +33,40 @@ CLIENT_ID = "HomeAssistant"
 CLIENT_SECRET = "SG9tZUFzc2lzdGFudA=="
 
 ENV_PATH = Path(__file__).parent / ".env"
+
+
+# --- HTTP retry helper ---
+
+def _request_with_retry(method, url, max_retries=3, **kwargs):
+    """HTTP request with exponential backoff retry.
+
+    Retries on: ConnectionError, Timeout, HTTP 5xx, 429.
+    Does NOT retry on: HTTP 4xx (except 429).
+    """
+    kwargs.setdefault("timeout", 30)
+    last_exc = None
+    for attempt in range(max_retries + 1):
+        try:
+            resp = requests.request(method, url, **kwargs)
+            if resp.status_code == 429 or resp.status_code >= 500:
+                if attempt < max_retries:
+                    wait = 2 ** attempt
+                    print(f"Retry {attempt+1}/{max_retries}: HTTP {resp.status_code} from {url}, waiting {wait}s", file=sys.stderr)
+                    time.sleep(wait)
+                    continue
+            resp.raise_for_status()
+            return resp
+        except (ConnectionError, Timeout) as e:
+            last_exc = e
+            if attempt < max_retries:
+                wait = 2 ** attempt
+                print(f"Retry {attempt+1}/{max_retries}: {type(e).__name__} for {url}, waiting {wait}s", file=sys.stderr)
+                time.sleep(wait)
+                continue
+            raise
+        except requests.HTTPError:
+            raise
+    raise last_exc
 
 
 def load_tokens():
@@ -60,7 +95,8 @@ def save_tokens(access_token, refresh_token, expires_in):
 
 def refresh_access_token(refresh_token):
     """Refresh the access token using the refresh token."""
-    resp = requests.post(
+    resp = _request_with_retry(
+        "POST",
         TOKEN_URL,
         data={
             "grant_type": "refresh_token",
@@ -68,9 +104,7 @@ def refresh_access_token(refresh_token):
             "client_id": CLIENT_ID,
             "client_secret": CLIENT_SECRET,
         },
-        timeout=30,
     )
-    resp.raise_for_status()
     data = resp.json()
     save_tokens(data["access_token"], data["refresh_token"], data["expires_in"])
     return data["access_token"]
@@ -98,13 +132,12 @@ def get_access_token():
 def api_get(url, params=None):
     """Make authenticated GET request to BLUETTI API."""
     token = get_access_token()
-    resp = requests.get(
+    resp = _request_with_retry(
+        "GET",
         url,
         headers={"Authorization": token},
         params=params,
-        timeout=30,
     )
-    resp.raise_for_status()
     data = resp.json()
     if data.get("msgCode") != 0:
         print(f"Error: API returned msgCode={data.get('msgCode')}", file=sys.stderr)
