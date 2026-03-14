@@ -84,14 +84,49 @@ def load_config(require_switchbot=True):
         "soc_max": int(os.getenv("SOC_MAX", "80")),
         "charge_rate_pct_per_slot": float(os.getenv("CHARGE_RATE_PCT_PER_SLOT", "10")),
         "default_consumption_rate": float(os.getenv("DEFAULT_CONSUMPTION_RATE", "3.0")),
+        "pushbullet_token": os.getenv("PUSHBULLET_TOKEN"),
     }
     if require_switchbot:
         required = ["switchbot_token", "switchbot_secret", "switchbot_device_id"]
         missing = [k for k in required if not config[k]]
         if missing:
-            print(f"Error: Missing config: {', '.join(missing)}", file=sys.stderr)
-            sys.exit(1)
+            raise RuntimeError(f"Missing config: {', '.join(missing)}")
     return config
+
+
+# --- Pushbullet Notification ---
+
+def notify(config, title, body):
+    """Send a push notification via Pushbullet. Fails silently."""
+    token = config.get("pushbullet_token")
+    if not token:
+        return
+    try:
+        requests.post(
+            "https://api.pushbullet.com/v2/pushes",
+            headers={"Access-Token": token},
+            json={"type": "note", "title": title, "body": body},
+            timeout=10,
+        )
+    except Exception as e:
+        print(f"Warning: Pushbullet notification failed: {e}", file=sys.stderr)
+
+
+def check_token_expiry(config):
+    """Warn if BLUETTI token expires within 7 days."""
+    load_dotenv(ENV_PATH, override=True)
+    expires_at = os.getenv("BLUETTI_TOKEN_EXPIRES_AT")
+    if not expires_at:
+        return
+    remaining = float(expires_at) - time.time()
+    days_left = remaining / 86400
+    if days_left <= 7:
+        notify(
+            config,
+            "BLUETTI: トークン期限切れ間近",
+            f"BLUETTIのAPIトークンが{days_left:.1f}日後に期限切れになります。\n"
+            f"'bluetti_battery.py setup' を実行して再認証してください。",
+        )
 
 
 # --- Looop Denki API ---
@@ -206,8 +241,7 @@ def switchbot_list_devices(config):
     resp = _request_with_retry("GET", f"{SWITCHBOT_API_BASE}/devices", headers=headers)
     data = resp.json()
     if data.get("statusCode") != 100:
-        print(f"Error: SwitchBot API: {data.get('message')}", file=sys.stderr)
-        sys.exit(1)
+        raise RuntimeError(f"SwitchBot API: {data.get('message')}")
     return data.get("body", {}).get("deviceList", [])
 
 
@@ -221,8 +255,7 @@ def switchbot_get_status(config):
     resp = _request_with_retry("GET", url, headers=headers)
     data = resp.json()
     if data.get("statusCode") != 100:
-        print(f"Error: SwitchBot API: {data.get('message')}", file=sys.stderr)
-        sys.exit(1)
+        raise RuntimeError(f"SwitchBot API: {data.get('message')}")
     body = data["body"]
     return {"power": body["power"], "weight": body.get("weight", 0)}
 
@@ -481,18 +514,21 @@ def cmd_run(args):
             action = switchbot_set_power(config, decision["charge"])
             print(f"Plug action: {action}")
 
+        check_token_expiry(config)
         print("=== done ===")
 
     except Exception as e:
         import traceback
         print(f"FAIL-SAFE: Error occurred: {e}", file=sys.stderr)
         traceback.print_exc()
+        notify(config, "BLUETTI: エラー発生", f"フェイルセーフが発動しました。\n{e}")
         if not args.dry_run:
             try:
                 action = switchbot_set_power(config, True)
                 print(f"FAIL-SAFE: Charger turned ON ({action})")
             except Exception as e2:
                 print(f"FAIL-SAFE: Could not control plug: {e2}", file=sys.stderr)
+                notify(config, "BLUETTI: プラグ制御失敗", f"フェイルセーフでプラグを制御できませんでした。\n{e2}")
         print("=== done (fail-safe) ===")
 
 
@@ -502,8 +538,7 @@ def cmd_list_devices(args):
     token = os.getenv("SWITCHBOT_TOKEN")
     secret = os.getenv("SWITCHBOT_SECRET")
     if not token or not secret:
-        print("Error: SWITCHBOT_TOKEN and SWITCHBOT_SECRET required", file=sys.stderr)
-        sys.exit(1)
+        raise RuntimeError("SWITCHBOT_TOKEN and SWITCHBOT_SECRET required")
 
     config = {"switchbot_token": token, "switchbot_secret": secret}
     devices = switchbot_list_devices(config)

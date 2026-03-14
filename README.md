@@ -90,7 +90,18 @@ SOC_MIN=20             # 強制充電する下限 (%)
 SOC_MAX=80             # 充電停止する上限 (%)
 CHARGE_RATE_PCT_PER_SLOT=10   # 30分の充電で増える SOC% (デフォルト: 10)
 DEFAULT_CONSUMPTION_RATE=3.0  # 履歴不足時のフォールバック消費率 %/h (デフォルト: 3.0)
+PUSHBULLET_TOKEN=<Pushbullet API トークン>  # 通知用 (任意)
 ```
+
+### Pushbullet 通知
+
+`PUSHBULLET_TOKEN` を設定すると、以下のイベント時に Pushbullet でプッシュ通知が送られます:
+
+- **エラー発生時** — フェイルセーフが発動した場合
+- **プラグ制御失敗時** — フェイルセーフで充電器を ON にできなかった場合
+- **トークン期限切れ間近** — BLUETTI API トークンの有効期限が残り7日以内の場合
+
+設定しない場合、通知なしで動作します。
 
 SwitchBot のデバイス ID は以下で確認できます:
 
