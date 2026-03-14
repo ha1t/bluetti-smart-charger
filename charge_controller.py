@@ -442,8 +442,7 @@ def cmd_run(args):
     try:
         soc = get_battery_soc()
         if soc is None:
-            print("Error: Could not get battery SOC", file=sys.stderr)
-            sys.exit(1)
+            raise RuntimeError("Could not get battery SOC")
         print(f"Battery SOC: {soc}%")
 
         prices = fetch_prices(config["looop_area"])

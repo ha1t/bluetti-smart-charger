@@ -87,7 +87,7 @@ def load_tokens():
 def save_tokens(access_token, refresh_token, expires_in):
     """Save tokens to .env file."""
     ENV_PATH.touch(exist_ok=True)
-    expires_at = str(time.time() + expires_in)
+    expires_at = str(time.time() + int(expires_in))
     set_key(str(ENV_PATH), "BLUETTI_ACCESS_TOKEN", access_token)
     set_key(str(ENV_PATH), "BLUETTI_REFRESH_TOKEN", refresh_token)
     set_key(str(ENV_PATH), "BLUETTI_TOKEN_EXPIRES_AT", expires_at)
@@ -114,17 +114,14 @@ def get_access_token():
     """Get a valid access token, refreshing if necessary."""
     tokens = load_tokens()
     if not tokens:
-        print("Error: Not authenticated. Run 'setup' first.", file=sys.stderr)
-        sys.exit(1)
+        raise RuntimeError("Not authenticated. Run 'setup' to re-authenticate.")
 
     # Refresh if expired (with 60s buffer)
     if time.time() >= tokens["expires_at"] - 60:
         try:
             return refresh_access_token(tokens["refresh_token"])
         except requests.HTTPError as e:
-            print(f"Error: Token refresh failed: {e}", file=sys.stderr)
-            print("Run 'setup' to re-authenticate.", file=sys.stderr)
-            sys.exit(1)
+            raise RuntimeError(f"Token refresh failed: {e}. Run 'setup' to re-authenticate.") from e
 
     return tokens["access_token"]
 
@@ -140,8 +137,7 @@ def api_get(url, params=None):
     )
     data = resp.json()
     if data.get("msgCode") != 0:
-        print(f"Error: API returned msgCode={data.get('msgCode')}", file=sys.stderr)
-        sys.exit(1)
+        raise RuntimeError(f"BLUETTI API returned msgCode={data.get('msgCode')}")
     return data.get("data")
 
 
