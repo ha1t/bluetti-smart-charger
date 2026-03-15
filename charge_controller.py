@@ -134,14 +134,20 @@ def check_token_expiry(config):
 def fetch_prices(area="01"):
     """Fetch today's and tomorrow's half-hour electricity prices from Looop API.
 
-    Returns dict with "today" (48 floats) and "tomorrow" (48 floats or None if not yet available).
+    Returns dict with "today" (48 floats), "tomorrow" (48 floats or None),
+    "today_level" (48 floats), "tomorrow_level" (48 floats or None).
+
+    Level values per slot: -0.5=でんき日和, 0=なし, 0.5=でんき注意報, 1=でんき警報
     """
     resp = _request_with_retry("GET", LOOOP_API_URL, params={"select_area": area})
     data = resp.json()
     tomorrow_data = data["2"].get("price_data", None)
+    tomorrow_level = data["2"].get("level", None)
     return {
         "today": data["1"]["price_data"],
         "tomorrow": tomorrow_data,
+        "today_level": data["1"]["level"],
+        "tomorrow_level": tomorrow_level,
     }
 
 
@@ -163,6 +169,8 @@ def get_current_price_info(prices):
     window = remaining_today + tomorrow[:needed_from_tomorrow]
     average_price = sum(window) / len(window)
 
+    current_level = prices["today_level"][slot_index]
+
     return {
         "current_price": current_price,
         "average_price": average_price,
@@ -170,6 +178,8 @@ def get_current_price_info(prices):
         "window_slots": len(window),
         "window_prices": window,
         "tomorrow_available": prices["tomorrow"] is not None,
+        "current_level": current_level,
+        "is_denki_biyori": current_level <= -0.5,
     }
 
 
@@ -422,8 +432,12 @@ def decide_charge(soc, price_info, config, consumption_rate=None):
 
     if soc <= soc_min:
         return {"charge": True, "reason": f"SOC {soc}% <= {soc_min}% (force charge)", "slots_needed": None}
-    if soc >= soc_max:
+    if soc >= 100 and price_info.get("is_denki_biyori"):
+        return {"charge": False, "reason": f"SOC {soc}% = 100% (battery full, stop charge even on でんき日和)", "slots_needed": None}
+    if soc >= soc_max and not price_info.get("is_denki_biyori"):
         return {"charge": False, "reason": f"SOC {soc}% >= {soc_max}% (stop charge)", "slots_needed": None}
+    if soc >= soc_max and price_info.get("is_denki_biyori"):
+        return {"charge": True, "reason": f"SOC {soc}% >= {soc_max}% but でんき日和 (charge to 100%)", "slots_needed": None}
 
     rate = consumption_rate if consumption_rate is not None else config["default_consumption_rate"]
     window_prices = price_info["window_prices"]
@@ -489,6 +503,8 @@ def cmd_run(args):
             f"Average price: {price_info['average_price']:.2f} yen/kWh"
             f" ({price_info['window_slots']}/48 slots){tomorrow_tag}"
         )
+        if price_info["is_denki_biyori"]:
+            print("でんき予報: でんき日和 (充電上限を100%に拡張)")
 
         consumption_rate = get_consumption_rate()
         if consumption_rate is not None:
