@@ -10,3 +10,11 @@
 ## 開発
 
 - Python スクリプト。仮想環境やビルドツールは不使用
+
+## テスト
+
+```bash
+.venv/bin/python -m unittest test_charge_controller -v
+```
+
+対象: `calculate_slots_needed`, `get_cheapest_slots`, `decide_charge` の純粋関数
