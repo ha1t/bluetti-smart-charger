@@ -221,6 +221,39 @@ class TestDecideCharge(unittest.TestCase):
         result = decide_charge(80, price_info, config)
         self.assertIsNone(result["slots_needed"])
 
+    def test_no_charge_when_above_average_even_if_in_cheapest_n(self):
+        # N が大きくて現在スロットが cheapest N に入っていても、
+        # 現在価格が平均を超えたら充電しない
+        config = make_config(soc_min=20, soc_max=80)
+        # 末尾2スロットだけ安い → avg ≈ 14.79, 現在価格=15.0 > avg
+        # N=12 のとき cheapest 12 は末尾2 + 先頭10 → index 0 が含まれる
+        prices = [15.0] * 46 + [10.0, 10.0]  # avg = (46*15+20)/48 ≈ 14.79
+        price_info = make_price_info(prices)
+        result = decide_charge(50, price_info, config, consumption_rate=3.0)
+        self.assertFalse(result["charge"])
+        self.assertIn("exceeds average", result["reason"])
+
+    def test_charge_when_in_cheapest_n_and_below_average(self):
+        # cheapest N に入っていて、かつ平均以下なら充電する
+        config = make_config(soc_min=20, soc_max=80)
+        # 現在価格=5.0、平均≈19.58 → 平均以下
+        prices = [5.0] + [20.0] * 47
+        price_info = make_price_info(prices)
+        result = decide_charge(30, price_info, config, consumption_rate=8.0)
+        self.assertTrue(result["charge"])
+
+    def test_no_charge_all_slots_needed_but_current_is_expensive(self):
+        # N=48/48 (全スロット必要) でも現在価格が平均超えなら充電しない
+        config = make_config(soc_min=20, soc_max=80)
+        # 消費率=充電率 → net=0 → N=window_size=48 (全スロット必要)
+        prices = [25.0] + [10.0] * 47  # avg ≈ 10.31
+        price_info = make_price_info(prices)
+        # soc=21 (soc_min=20 を超えているので強制充電は発動しない)
+        result = decide_charge(21, price_info, config, consumption_rate=20.0)
+        # N=48、index 0 は cheapest 48 に含まれるが 25 > avg → 充電しない
+        self.assertFalse(result["charge"])
+        self.assertIn("exceeds average", result["reason"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -456,14 +456,24 @@ def decide_charge(soc, price_info, config, consumption_rate=None):
 
     cheapest = get_cheapest_slots(window_prices, slots_needed)
     # Slot 0 in the window is the current slot
-    is_cheap_slot = 0 in cheapest
+    in_cheapest = 0 in cheapest
+    below_avg = price_info["current_price"] <= price_info["average_price"]
 
-    if is_cheap_slot:
+    if in_cheapest and below_avg:
         return {
             "charge": True,
             "reason": (
                 f"price {price_info['current_price']:.2f} is in cheapest {slots_needed}"
                 f"/{len(window_prices)} slots (charge)"
+            ),
+            "slots_needed": slots_needed,
+        }
+    if in_cheapest and not below_avg:
+        return {
+            "charge": False,
+            "reason": (
+                f"price {price_info['current_price']:.2f} exceeds average"
+                f" {price_info['average_price']:.2f} (too expensive)"
             ),
             "slots_needed": slots_needed,
         }
