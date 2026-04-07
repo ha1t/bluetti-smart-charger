@@ -30,6 +30,7 @@ import bluetti_battery
 
 ENV_PATH = Path(__file__).parent / ".env"
 DB_PATH = Path(__file__).parent / "soc_history.db"
+TOKEN_EXPIRY_NOTIFY_STATE = Path(__file__).parent / ".token_expiry_notify.state"
 
 LOOOP_API_URL = "https://looop-denki.com/api/prices"
 SWITCHBOT_API_BASE = "https://api.switch-bot.com/v1.1"
@@ -113,20 +114,31 @@ def notify(config, title, body):
 
 
 def check_token_expiry(config):
-    """Warn if BLUETTI token expires within 7 days."""
+    """Warn if BLUETTI token expires within 7 days (at most once per day)."""
     load_dotenv(ENV_PATH, override=True)
     expires_at = os.getenv("BLUETTI_TOKEN_EXPIRES_AT")
     if not expires_at:
         return
     remaining = float(expires_at) - time.time()
     days_left = remaining / 86400
-    if days_left <= 7:
-        notify(
-            config,
-            "BLUETTI: トークン期限切れ間近",
-            f"BLUETTIのAPIトークンが{days_left:.1f}日後に期限切れになります。\n"
-            f"'bluetti_battery.py setup' を実行して再認証してください。",
-        )
+    if days_left > 7:
+        return
+
+    today = datetime.datetime.now(JST).date().isoformat()
+    try:
+        last_notified = TOKEN_EXPIRY_NOTIFY_STATE.read_text().strip()
+    except FileNotFoundError:
+        last_notified = ""
+    if last_notified == today:
+        return
+
+    notify(
+        config,
+        "BLUETTI: トークン期限切れ間近",
+        f"BLUETTIのAPIトークンが{days_left:.1f}日後に期限切れになります。\n"
+        f"'bluetti_battery.py setup' を実行して再認証してください。",
+    )
+    TOKEN_EXPIRY_NOTIFY_STATE.write_text(today)
 
 
 # --- Looop Denki API ---
